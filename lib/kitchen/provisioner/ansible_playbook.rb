@@ -46,7 +46,8 @@ module Kitchen
       default_config :ansible_version, nil
       default_config :require_ansible_repo, true
       default_config :extra_vars, {}
-      default_config :ansible_apt_repo, "ppa:rquillo/ansible"
+      default_config :tags, []
+      default_config :ansible_apt_repo, "ppa:ansible/ansible"
       default_config :ansible_yum_repo, "https://download.fedoraproject.org/pub/epel/6/i386/epel-release-6-8.noarch.rpm"
       default_config :chef_bootstrap_url, "https://www.getchef.com/chef/install.sh"
 
@@ -64,6 +65,10 @@ module Kitchen
          provisioner.calculate_path('group_vars', :directory)
       end
 
+      default_config :additional_copy_path do |provisioner|
+         provisioner.calculate_path('addt_dir', :directory)
+      end
+
       default_config :host_vars_path do |provisioner|
          provisioner.calculate_path('host_vars', :directory)
       end
@@ -76,9 +81,11 @@ module Kitchen
         provisioner.calculate_path('Ansiblefile', :file)
       end
 
+      default_config :requirements_path, false
       default_config :ansible_verbose, false
       default_config :ansible_verbosity, 1
-      default_config :ansible_noop, false   # what is ansible equivalent of dry_run???? ##JMC: I think it's [--check mode](http://docs.ansible.com/playbooks_checkmode.html) TODO: Look into this...
+      default_config :ansible_check, false
+      default_config :ansible_diff, false
       default_config :ansible_platform, ''
       default_config :update_package_repos, true
 
@@ -136,6 +143,7 @@ module Kitchen
           info("Installing ansible on #{ansible_platform}")
           <<-INSTALL
           if [ ! $(which ansible) ]; then
+           #{update_packages_debian_cmd}
             ## Install apt-utils to silence debconf warning: http://serverfault.com/q/358943/77156
             #{sudo('apt-get')} -y install apt-utils
             ## Fix debconf tty warning messages
@@ -148,7 +156,6 @@ module Kitchen
           #  #{sudo('dpkg')} -i #{ansible_apt_repo_file}
           #  #{sudo('apt-get')} -y autoremove ## These autoremove/autoclean are sometimes useful but
           #  #{sudo('apt-get')} -y autoclean  ## don't seem necessary for the Ubuntu OpsCode bento boxes that are not EOL by Canonical
-          #  #{update_packages_debian_cmd}
           #  #{sudo('apt-get')} -y --force-yes install ansible#{ansible_debian_version} python-selinux
             ## 10.04 version of add-apt-repository doesn't accept --yes
             ## later versions require interaction from user, so we must specify --yes
@@ -181,6 +188,7 @@ module Kitchen
                #{update_packages_redhat_cmd}
                #{sudo('yum')} -y install ansible#{ansible_redhat_version} libselinux-python
             else
+           #{update_packages_debian_cmd}
            ## Install apt-utils to silence debconf warning: http://serverfault.com/q/358943/77156
             #{sudo('apt-get')} -y install apt-utils
             ## Fix debconf tty warning messages
@@ -193,7 +201,6 @@ module Kitchen
           #  #{sudo('dpkg')} -i #{ansible_apt_repo_file}
           #  #{sudo('apt-get')} -y autoremove ## These autoremove/autoclean are sometimes useful but
           #  #{sudo('apt-get')} -y autoclean  ## don't seem necessary for the Ubuntu OpsCode bento boxes that are not EOL by Canonical
-          #  #{update_packages_debian_cmd}
           #  #{sudo('apt-get')} -y --force-yes install ansible#{ansible_debian_version} python-selinux
             ## 10.04 version of add-apt-repository doesn't accept --yes
             ## later versions require interaction from user, so we must specify --yes
@@ -213,20 +220,33 @@ module Kitchen
       end
 
       def install_busser
-          <<-INSTALL
+        install = ''
+        install << <<-INSTALL
           #{Util.shell_helpers}
-          # install chef omnibus so that busser works as this is needed to run tests :(
-          # TODO: work out how to install enough ruby
-          # and set busser: { :ruby_bindir => '/usr/bin/ruby' } so that we dont need the
-          # whole chef client
-          if [ ! -d "/opt/chef" ]
-          then
-            echo "-----> Installing Chef Omnibus to install busser to run tests"
-            do_download #{chef_url} /tmp/install.sh
-            #{sudo('sh')} /tmp/install.sh
+          # Fix for https://github.com/test-kitchen/busser/issues/12
+          if [ -h /usr/bin/ruby ]; then
+              L=$(readlink -f /usr/bin/ruby)
+              #{sudo('rm')} /usr/bin/ruby
+              #{sudo('ln')} -s $L /usr/bin/ruby
           fi
           INSTALL
-          end
+        if chef_url then
+          install << <<-INSTALL
+            # install chef omnibus so that busser works as this is needed to run tests :(
+            # TODO: work out how to install enough ruby
+            # and set busser: { :ruby_bindir => '/usr/bin/ruby' } so that we dont need the
+            # whole chef client
+            if [ ! -d "/opt/chef" ]
+            then
+              echo "-----> Installing Chef Omnibus to install busser to run tests"
+              do_download #{chef_url} /tmp/install.sh
+              #{sudo('sh')} /tmp/install.sh
+            fi
+            INSTALL
+        end
+
+        install
+      end
 
         def init_command
           dirs = %w{modules roles group_vars host_vars}.
@@ -248,6 +268,7 @@ module Kitchen
           prepare_roles
           prepare_ansible_cfg
           prepare_group_vars
+          prepare_addt_dir
           prepare_host_vars
           prepare_hosts
           info('Finished Preparing files for transfer')
@@ -275,6 +296,13 @@ module Kitchen
               sudo('cp -r'), File.join(config[:root_path],'host_vars'), '/etc/ansible/.',
           ].join(' ')
 
+          if galaxy_requirements
+            commands << [
+               sudo('ansible-galaxy'), 'install', '--force',
+               '-r', File.join(config[:root_path], galaxy_requirements),
+            ].join(' ')
+          end
+
           command = commands.join(' && ')
           debug(command)
           command
@@ -289,6 +317,7 @@ module Kitchen
             ansible_check_flag,
             ansible_diff_flag,
             extra_vars,
+            tags,
             "#{File.join(config[:root_path], File.basename(config[:playbook]))}",
           ].join(" ")
         end
@@ -322,6 +351,10 @@ module Kitchen
           config[:ansiblefile_path] or ''
         end
 
+        def galaxy_requirements
+          config[:requirements_path] or nil
+        end
+
         def playbook
           config[:playbook]
         end
@@ -344,6 +377,10 @@ module Kitchen
 
         def group_vars
           config[:group_vars_path].to_s
+        end
+
+        def addt_dir
+          config[:additional_copy_path].to_s
         end
 
         def host_vars
@@ -383,11 +420,26 @@ module Kitchen
         end
 
         def extra_vars
-          return nil if config[:extra_vars].none?
-          bash_vars = JSON.dump(config[:extra_vars])
+          bash_vars = config[:extra_vars]
+          if config.key?(:attributes) && config[:attributes].key?(:extra_vars) && config[:attributes][:extra_vars].is_a?(Hash)
+            bash_vars = config[:attributes][:extra_vars]
+          end
+
+          return nil if bash_vars.none?
+          bash_vars = JSON.dump(bash_vars)
           bash_vars = "-e '#{bash_vars}'"
           debug(bash_vars)
           bash_vars
+        end
+
+        def tags
+          bash_tags = config.key?(:attributes) && config[:attributes].key?(:tags) && config[:attributes][:tags].is_a?(Array) ? config[:attributes][:tags] : config[:tags]
+          return nil if bash_tags.empty?
+
+          bash_tags = bash_tags.join(",")
+          bash_tags = "-t '#{bash_tags}'"
+          debug(bash_tags)
+          bash_tags
         end
 
         def ansible_apt_repo
@@ -411,6 +463,10 @@ module Kitchen
           debug("Using roles from #{roles}")
 
           resolve_with_librarian if File.exists?(ansiblefile)
+
+          if galaxy_requirements
+            FileUtils.cp(galaxy_requirements, File.join(sandbox_path, galaxy_requirements))
+          end
                     
           # Detect whether we are running tests on a role
           # If so, make sure to copy into VM so dir structure is like: /tmp/kitchen/roles/role_name
@@ -473,6 +529,20 @@ module Kitchen
 
           debug("Using group_vars from #{group_vars}")
           FileUtils.cp_r(Dir.glob("#{group_vars}/*"), tmp_group_vars_dir)
+        end
+
+        def prepare_addt_dir
+          info('Preparing additional_copy_path')
+          tmp_addt_dir = File.join(sandbox_path, File.basename(addt_dir))
+          FileUtils.mkdir_p(tmp_addt_dir)
+
+          unless File.directory?(addt_dir)
+            info 'nothing to do for additional_copy_path'
+            return
+          end
+
+          debug("Using additional_copy_path from #{addt_dir}")
+          FileUtils.cp_r(Dir.glob("#{addt_dir}/*"), tmp_addt_dir)
         end
 
         def prepare_host_vars
